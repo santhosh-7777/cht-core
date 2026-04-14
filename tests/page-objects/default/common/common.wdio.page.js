@@ -178,7 +178,14 @@ const waitForLoaders = async (timeout = 5000) => {
 };
 
 const waitForAngularLoaded = async (timeout = 40000) => {
-  await hamburgerMenuSelectors.hamburgerMenu().waitForDisplayed({ timeout });
+  await browser.waitUntil(async () => {
+    const menu = await hamburgerMenuSelectors.hamburgerMenu();
+    return await menu.isDisplayed();
+  }, {
+    timeout,
+    interval: 500,
+    timeoutMsg: 'Application menu did not appear in time'
+  });
 };
 
 const waitForPageLoaded = async (timeout) => {
