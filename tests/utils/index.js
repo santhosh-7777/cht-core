@@ -162,13 +162,18 @@ const randomIp = () => {
   return `${section()}.${section()}.${section()}.${section()}`;
 };
 
+const stringifyParam = (key, value) => {
+  if (key.startsWith('start') || key.startsWith('end') || key.startsWith('doc_ids') || Array.isArray(value)) {
+    return JSON.stringify(value);
+  }
+  return value;
+};
+
 const getRequestUri = (options) => {
   let uri = (options.uri || `${constants.BASE_URL}${options.path}`);
   if (options.qs) {
     Object.keys(options.qs).forEach((key) => {
-      if (Array.isArray(options.qs[key])) {
-        options.qs[key] = JSON.stringify(options.qs[key]);
-      }
+      options.qs[key] = stringifyParam(key, options.qs[key]);
     });
     uri = `${uri}?${new URLSearchParams(options.qs).toString()}`;
   }
@@ -551,11 +556,16 @@ const updateCustomSettings = async (updates) => {
   });
 };
 
-const waitForSettingsUpdateLogs = (type) => {
-  if (type === 'sentinel') {
-    return waitForSentinelLogs(true, /Reminder messages allowed between/);
-  }
-  return waitForApiLogs(/Settings updated/);
+const waitForSettingsUpdate = async () => {
+  const apiWatcher = await waitForApiLogs(/Settings updated/);
+  const sentinelWatcher = await waitForSentinelLogs(true, /Reminder messages allowed between/);
+  return {
+    promise: Promise.all([apiWatcher.promise, sentinelWatcher.promise]),
+    cancel: () => {
+      apiWatcher.cancel();
+      sentinelWatcher.cancel();
+    }
+  };
 };
 
 /**
@@ -579,10 +589,9 @@ const waitForSettingsUpdateLogs = (type) => {
  *                           The keys should correspond to the settings that need to be updated,
  *                           and the values should be the new values for those settings.
  * @param {Object} [options={}] - Options to control the behavior of the update.
- * @param {boolean} [options.ignoreReload=false] - if `false`, will wait for reload modal and reload. if `truthy`,
- *                                                 will tail service logs and resolve when new settings are loaded.
- *                                                 By default, watches api logs, if value equals 'sentinel', will
- *                                                 watch sentinel logs instead.
+ * @param {boolean|string} [options.ignoreReload=false] - if `false`, will wait for reload modal and reload.
+ *                                                 if `truthy`, will tail service logs and resolve when new
+ *                                                 settings are loaded. Both api and sentinel logs are watched.
  * @param {boolean} [options.sync=false] - If `true`, the function will perform a synchronization
  *                                         after updating the settings. Defaults to `false`.
  * @param {boolean} [options.refresh=false] - If `true`, the function will refresh the browser after
@@ -599,13 +608,22 @@ const updateSettings = async (updates, options = {}) => {
   if (revert) {
     await revertSettings(true);
   }
-  const watcher = ignoreReload && Object.keys(updates).length && await waitForSettingsUpdateLogs(ignoreReload);
-  await updateCustomSettings(updates);
-  if (!ignoreReload && !sync) {
-    return await commonElements.closeReloadModal(true);
-  }
+
+  const watcher = Object.keys(updates).length && await waitForSettingsUpdate();
+
+  const result = await updateCustomSettings(updates);
+  const needsRefresh = result && result.updated;
+
   if (watcher) {
-    await watcher.promise;
+    if (needsRefresh) {
+      await watcher.promise;
+    } else {
+      watcher.cancel();
+    }
+  }
+
+  if (!ignoreReload && !sync && (needsRefresh || await hasModal())) {
+    await commonElements.closeReloadModal(true);
   }
   if (sync) {
     await commonElements.sync();
@@ -638,11 +656,14 @@ const revertCustomSettings = async () => {
  * @return {Promise}       completion promise
  */
 const revertSettings = async ignoreRefresh => {
-  const watcher = ignoreRefresh && await waitForSettingsUpdateLogs();
+  const watcher = ignoreRefresh && await waitForSettingsUpdate();
   const needsRefresh = await revertCustomSettings();
 
   if (!ignoreRefresh) {
-    return needsRefresh && await commonElements.closeReloadModal(true);
+    if (needsRefresh || await hasModal()) {
+      await commonElements.closeReloadModal(true);
+    }
+    return;
   }
 
   if (!needsRefresh) {
@@ -748,7 +769,7 @@ const revertDb = async (except = [], ignoreRefresh = true) => { //NOSONAR
   await deleteAllDocs(except);
   await revertTranslations();
   await deleteLocalDocs();
-  const watcher = ignoreRefresh && await waitForSettingsUpdateLogs();
+  const watcher = ignoreRefresh && await waitForSettingsUpdate();
   const needsRefresh = await revertCustomSettings();
 
   // only refresh if the settings were changed or modal was already present and we're not explicitly ignoring
@@ -763,8 +784,21 @@ const revertDb = async (except = [], ignoreRefresh = true) => { //NOSONAR
 
   await deleteMetaDbs();
   await deleteCredentials();
+  await clearReplicationFailureLogs();
 
   await setUserContactDoc();
+};
+
+const clearReplicationFailureLogs = async () => {
+  const result = await logsDb.allDocs({
+    startkey: 'replication-fail-',
+    endkey: 'replication-fail-\ufff0',
+  });
+  if (!result.rows.length) {
+    return;
+  }
+  const docs = result.rows.map(row => ({ _id: row.id, _rev: row.value.rev, _deleted: true }));
+  await logsDb.bulkDocs(docs);
 };
 
 const getOrigin = () => `${constants.BASE_URL}`;
@@ -787,7 +821,6 @@ const getLoggedInUser = async () => {
     return userCtx.name;
   } catch (err) {
     console.warn('Error getting userCtx', err.message);
-    return;
   }
 };
 
@@ -899,6 +932,19 @@ const getUserSettings = ({ contactId, name }) => {
     }));
 };
 
+const waitForApiCrash = async () => {
+  let retryCount = 180;
+  do {
+    try {
+      await request({ path: '/api/info' });
+      await delayPromise(500);
+    } catch {
+      return;
+    }
+  } while (retryCount-- > 0);
+  throw new Error('API expected to crash, but still running after 1.5 minutes');
+};
+
 const listenForApi = async () => {
   const totalTries = 180; // 3 minutes
   let retryCount = totalTries;
@@ -919,6 +965,58 @@ const listenForApi = async () => {
     }
   } while (--retryCount > 0);
   throw new Error('API failed to start after 3 minutes');
+};
+
+const NGINX_PORT_HINT =
+  'Ports 80 and/or 443 are often already in use; stop the other service or set NGINX_HTTP_PORT ' +
+  'and NGINX_HTTPS_PORT (see tests/constants.js for HTTPS).';
+
+const waitForNginxContainerRunning = async () => {
+  if (!isDocker()) {
+    return;
+  }
+  const containerName = getContainerName('nginx');
+  const maxTries = 30;
+  for (let i = 0; i < maxTries; i++) {
+    let state;
+    try {
+      const rawState = await runCommand(
+        `docker inspect -f '{{json .State}}' ${containerName}`,
+        { verbose: false }
+      );
+      state = JSON.parse(rawState);
+    } catch (err) {
+      throw new Error(
+        `Expected nginx container "${containerName}" was not found after docker compose up ` +
+        `(${err.message}). ${NGINX_PORT_HINT}`
+      );
+    }
+
+    // A failed port bind leaves the container in `created` state (never exited/dead) with the
+    // real reason in `State.Error`, so check it explicitly to fail fast on the issue #9491 case.
+    if (state.Error) {
+      throw new Error(
+        `nginx container "${containerName}" failed to start: ${state.Error} ` +
+        `(exitCode: ${state.ExitCode}). ${NGINX_PORT_HINT}`
+      );
+    }
+
+    if (state.Status === 'exited' || state.Status === 'dead') {
+      throw new Error(
+        `nginx container "${containerName}" failed to start ` +
+        `(status: ${state.Status}, exitCode: ${state.ExitCode}). ${NGINX_PORT_HINT}`
+      );
+    }
+
+    if (state.Status === 'running') {
+      return;
+    }
+
+    await delayPromise(1000);
+  }
+  throw new Error(
+    `nginx container "${containerName}" did not become running within ${maxTries} tries. ${NGINX_PORT_HINT}`
+  );
 };
 
 const dockerComposeCmd = (params) => {
@@ -1089,6 +1187,25 @@ const waitForDocRev = (ids) => {
   });
 };
 
+const waitForAuditCount = async (docId, expectedCount, retries = 15) => {
+  const results = await auditDb.allDocs({
+    start_key: docId,
+    end_key: `${docId}\ufff0`,
+    include_docs: true
+  });
+  const totalHistory = results.rows.reduce((acc, row) => acc + (row.doc.history ? row.doc.history.length : 0), 0);
+  if (totalHistory >= expectedCount) {
+    return;
+  }
+  if (retries <= 0) {
+    throw new Error(`Timed out waiting for audit count to reach ${expectedCount} for doc ${docId}`);
+  }
+  await delayPromise(200);
+  return waitForAuditCount(docId, expectedCount, retries - 1);
+};
+
+
+
 const getDefaultSettings = () => {
   const pathToDefaultAppSettings = path.join(__dirname, '../config.default.json');
   return JSON.parse(fs.readFileSync(pathToDefaultAppSettings).toString());
@@ -1249,6 +1366,7 @@ const startServices = async () => {
   env.COUCHDB_NOUVEAU_DATA = makeTempDir('ci-nouveaudata');
 
   await dockerComposeCmd('up -d');
+  await waitForNginxContainerRunning();
   const services = await dockerComposeCmd('ps -q');
   if (!services.length) {
     throw new Error('Errors when starting services');
@@ -1365,6 +1483,8 @@ const prepK3DServices = async (defaultSettings) => {
   await runAndLogApiStartupMessage('User contact doc setup', setUserContactDoc);
   await runAndLogApiStartupMessage('Getting default forms', getDefaultForms);
 
+  await disableCompaction();
+
   await loginUser();
   await setupUserDoc();
 };
@@ -1383,6 +1503,8 @@ const prepServices = async (defaultSettings) => {
   }
   await runAndLogApiStartupMessage('User contact doc setup', setUserContactDoc);
   await runAndLogApiStartupMessage('Getting default forms', getDefaultForms);
+
+  await disableCompaction();
 
   await loginUser();
   await setupUserDoc();
@@ -1409,6 +1531,20 @@ const getLogs = (container) => {
       logWriteStream.end();
     });
   });
+};
+
+// compaction will delete bodies from old revs
+// some tests specifically test loading older revs for offline users, which intermittenly fail when compaction runs.
+const disableCompaction = async () => {
+  const nodes = await request({ path: '/_membership' });
+  for (const node of nodes.cluster_nodes) {
+    await request({
+      path: `/_node/${node}/_config/smoosh.ratio_dbs/min_changes`,
+      method: 'PUT',
+      body: '"100000000000"',
+      json: false,
+    });
+  }
 };
 
 const saveLogs = async () => {
@@ -1748,6 +1884,7 @@ module.exports = {
   updateSettings,
   revertSettings,
   revertDb,
+  clearReplicationFailureLogs,
   getOrigin,
   getBaseUrl,
   getAdminBaseUrl,
@@ -1767,7 +1904,9 @@ module.exports = {
   delayPromise,
   setTransitionSeqToNow,
   waitForDocRev,
+  waitForAuditCount,
   getDefaultSettings,
+
   addTranslations,
   enableLanguage,
   enableLanguages,
@@ -1793,6 +1932,8 @@ module.exports = {
   isK3D,
   stopCouchDb,
   startCouchDb,
+  stopService,
+  startService,
   getDefaultForms,
   toggleSentinelTransitions,
   runSentinelTasks,
@@ -1800,4 +1941,5 @@ module.exports = {
   deletePurgeDbs,
   saveLogs,
   waitForIndexes,
+  waitForApiCrash,
 };
